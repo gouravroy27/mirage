@@ -1,4 +1,6 @@
 import { Buffer } from 'node:buffer'
+import { Readable } from 'node:stream'
+import type { ReadableStream as NodeReadableStream } from 'node:stream/web'
 import { DEFAULT_MAX_REQUEST_BODY_SIZE } from '@modelcontextprotocol/server'
 import { closeQuietly } from '@struktoai/mirage-core/io/stream'
 import type { ResourceStore } from '@struktoai/mirage-core/resources/base'
@@ -286,12 +288,18 @@ function downloadOf(
   })
 }
 
+function nodeCommandStream(body: ReadableStream<Uint8Array>, stalled: AbortSignal): Readable {
+  const stream = Readable.fromWeb(body as NodeReadableStream<Uint8Array>)
+  stalled.addEventListener('abort', () => stream.destroy(), { once: true })
+  return stream
+}
+
 export function router(
   app: RouteApp,
   deps: WorkspaceRoutesDeps & { resources: ResourceStore; sandboxes: Sandboxes },
 ): void {
   const { sandboxes } = deps
-  registerProcess(app, sandboxes, deps.registry)
+  registerProcess(app, sandboxes, deps.registry, nodeCommandStream)
   app.post(constants.CREATE, { bodyLimit: MAX_REQUEST_PART }, async (req, reply) => {
     const input = CreateSandboxRequest.safeParse(req.body === undefined ? {} : req.body)
     if (!input.success) throw new HttpError('invalid_request', 'invalid sandbox create request')

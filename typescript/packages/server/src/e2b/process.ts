@@ -12,7 +12,7 @@ import { decodeStart, endStream, type StartCommand } from './connect.ts'
 import * as constants from './constants.ts'
 import { InvalidConnectRequest, UnsupportedProcessOption } from './errors.ts'
 import type { Sandboxes, SandboxLease } from './sandbox.ts'
-import { processResponse, remainingSeconds } from './stream.ts'
+import { type CommandTransport, processResponse, remainingSeconds } from './stream.ts'
 
 const PROCESS_PATHS = new Set([
   constants.START,
@@ -133,6 +133,7 @@ export function registerProcess(
   app: RouteApp,
   sandboxes: Sandboxes,
   registry: WorkspaceRegistry,
+  transport: CommandTransport,
 ): void {
   let nextPid = 0
   app.post(constants.START, { rawBody: true }, async (req, reply) => {
@@ -166,7 +167,7 @@ export function registerProcess(
       do {
         nextPid = (nextPid % 0xffffffff) + 1
       } while (lease.processes.has(nextPid))
-      return processResponse(lease, command, deadline, nextPid, req.closed, reply)
+      return processResponse(lease, command, deadline, nextPid, req.closed, reply, transport)
     } catch (error) {
       closeUnreadBody(req, reply)
       if (uploadDeadline.signal.aborted && error === uploadDeadline.signal.reason) {

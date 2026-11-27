@@ -1,5 +1,3 @@
-import { PassThrough, Readable } from 'node:stream'
-import { pipeline } from 'node:stream/promises'
 import { BytePipe } from '@struktoai/mirage-core/io/pipe'
 import {
   ABORT_JOIN_MS,
@@ -14,6 +12,14 @@ import { encodeMessage, endStream, type StartCommand } from './connect.ts'
 import * as constants from './constants.ts'
 import type { LiveProcess, SandboxLease } from './sandbox.ts'
 
+/**
+ * What a host sends for a command's output stream: the web stream itself, or
+ * a Node stream around it on the daemon. `stalled` aborts when the command
+ * outlived its deadline and the client stopped reading, so the host closes
+ * the response.
+ */
+export type CommandTransport = (body: ReadableStream<Uint8Array>, stalled: AbortSignal) => unknown
+
 export function remainingSeconds(deadline: number | null): number | null {
   return deadline === null ? null : Math.max(0, deadline - performance.now()) / 1000
 }
@@ -25,14 +31,16 @@ export function processResponse(
   pid: number,
   closed: AbortSignal,
   reply: RouteReply,
+  transport: CommandTransport,
 ): RouteReply {
   const canceled = new AbortController()
   const connection = AbortSignal.any([closed, canceled.signal])
   const deadline = new AbortController()
-  const body = new PassThrough()
   let grace: ReturnType<typeof setTimeout> | undefined
   const closeStalledStream = (): void => {
-    grace ??= setTimeout(() => body.destroy(), ABORT_JOIN_MS)
+    grace ??= setTimeout(() => {
+      stall()
+    }, ABORT_JOIN_MS)
   }
   const expire = (): void => {
     deadline.abort(new DOMException(constants.DEADLINE_MESSAGE, 'TimeoutError'))
@@ -120,18 +128,55 @@ export function processResponse(
     execution?.cancel()
     closeStalledStream()
   }
-  body.once('close', () => {
+  const source = events()
+  let open = true
+  const finish = (error?: unknown): void => {
+    if (!open) return
+    open = false
+    if (error !== undefined && !connection.aborted && !lease.revoked.aborted) {
+      console.debug('sandbox command transport closed', error)
+    }
     clearTimeout(grace)
     lease.revoked.removeEventListener('abort', revoke)
     canceled.abort()
+    void source.return(undefined).catch((cause: unknown) => {
+      console.debug('sandbox command events closed', cause)
+    })
+  }
+  const stalled = new AbortController()
+  let stall = (): void => undefined
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      stall = () => {
+        if (!open) return
+        const error = new DOMException('command stream stalled', 'AbortError')
+        stalled.abort(error)
+        controller.error(error)
+        finish(error)
+      }
+    },
+    async pull(controller) {
+      let next: IteratorResult<Uint8Array>
+      try {
+        next = await source.next()
+      } catch (error) {
+        if (open) controller.error(error)
+        finish(error)
+        return
+      }
+      if (!open) return
+      if (next.done === true) {
+        controller.close()
+        finish()
+      } else {
+        controller.enqueue(next.value)
+      }
+    },
+    cancel() {
+      finish()
+    },
   })
   if (lease.revoked.aborted) revoke()
   else lease.revoked.addEventListener('abort', revoke, { once: true })
-  const response = reply.type(constants.CONNECT_STREAM).send(body)
-  void pipeline(Readable.from(events(), { objectMode: false }), body).catch((error: unknown) => {
-    if (!connection.aborted && !lease.revoked.aborted) {
-      console.debug('sandbox command transport closed', error)
-    }
-  })
-  return response
+  return reply.type(constants.CONNECT_STREAM).send(transport(body, stalled.signal))
 }
