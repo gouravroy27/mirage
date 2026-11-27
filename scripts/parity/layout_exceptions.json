@@ -209,7 +209,8 @@
     "routing": "The FastAPI boundary resolves and authenticates a sandbox from the request. The TypeScript lease table accepts header values directly."
    },
    "typescript_only": {
-    "body": "Node watches the raw input stream and closes connections with unread data; Python uses ASGI body and disconnect messages."
+    "body": "Node watches the raw input stream and closes connections with unread data; Python uses ASGI body and disconnect messages.",
+    "types": "The lease store and web handler shapes another TypeScript host (the Cloudflare Worker) implements to serve E2B through the server's ./e2b export. Python has one host and no such export."
    }
   },
   "core/disk": {
