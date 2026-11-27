@@ -300,6 +300,13 @@ jobs:
           ./python/.venv/bin/python scripts/check_cli_cold_start.py --selftest
           ./python/.venv/bin/python scripts/check_cli_cold_start.py
 
+      # A Cloudflare Worker serves E2B from the server's ./e2b export, so what
+      # that entry adds over core must load without Fastify, a Node stream,
+      # Node's process object or the Node host.
+      - name: E2B export loads in a Worker
+        working-directory: typescript/packages/server
+        run: pnpm check:e2b
+
       # The docs build parses frontmatter as YAML and stops on the first page
       # it cannot read, so an unquoted description holding ": " fails the
       # deploy with no local signal at all.
