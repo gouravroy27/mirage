@@ -210,7 +210,10 @@
    },
    "typescript_only": {
     "body": "Node watches the raw input stream and closes connections with unread data; Python uses ASGI body and disconnect messages.",
-    "types": "The lease store and web handler shapes another TypeScript host (the Cloudflare Worker) implements to serve E2B through the server's ./e2b export. Python has one host and no such export."
+    "types": "The lease store and web handler shapes another TypeScript host (the Cloudflare Worker) implements to serve E2B through the server's ./e2b export. Python has one host and no such export.",
+    "access": "The access check and route predicates both TypeScript hosts share: the daemon's Fastify hooks and the ./e2b export answer a refused sandbox alike. Python's routing module serves its one host.",
+    "lifecycle": "The lifecycle half of the E2B router, over a lease store, so a host that keeps sandboxes elsewhere imports it through ./e2b. Python keeps it in its router.",
+    "data": "The data half of the E2B router, against one workspace, so a host that runs each workspace apart imports it through ./e2b. Python keeps it in its router."
    }
   },
   "core/disk": {

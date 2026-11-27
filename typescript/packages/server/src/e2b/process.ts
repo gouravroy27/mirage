@@ -5,14 +5,13 @@ import { decodeBase64 } from '@struktoai/mirage-core/utils/base64'
 import { z } from '@struktoai/mirage-core/vfs/secrets'
 import { HttpError } from '../errors.ts'
 import { MAX_REQUEST_PART } from '../multipart.ts'
-import type { WorkspaceRegistry } from '../registry.ts'
 import type { RouteApp, RouteReply, RouteRequest } from '../routes.ts'
 import { closeUnreadBody, readBody, readJsonBody, unaryContentType } from './body.ts'
 import { decodeStart, endStream, type StartCommand } from './connect.ts'
 import * as constants from './constants.ts'
 import { InvalidConnectRequest, UnsupportedProcessOption } from './errors.ts'
-import type { Sandboxes, SandboxLease } from './sandbox.ts'
-import { type CommandTransport, processResponse, remainingSeconds } from './stream.ts'
+import { processResponse, remainingSeconds } from './stream.ts'
+import type { ActiveSandbox, DataAccess } from './types.ts'
 
 const PROCESS_PATHS = new Set([
   constants.START,
@@ -56,7 +55,7 @@ function failure(reply: RouteReply, status: number, code: string, message: strin
 }
 
 async function control(
-  lease: SandboxLease,
+  lease: ActiveSandbox,
   method: (typeof constants.CONTROL_METHODS)[number],
   body: unknown,
   reply: RouteReply,
@@ -129,12 +128,8 @@ async function control(
   return reply.send({})
 }
 
-export function registerProcess(
-  app: RouteApp,
-  sandboxes: Sandboxes,
-  registry: WorkspaceRegistry,
-  transport: CommandTransport,
-): void {
+/** The command stream: run one command and stream its output. */
+export function registerStart(app: RouteApp, access: DataAccess): void {
   let nextPid = 0
   app.post(constants.START, { rawBody: true }, async (req, reply) => {
     const uploadDeadline = new AbortController()
@@ -143,7 +138,7 @@ export function registerProcess(
     }
     let disarm: (() => void) | undefined
     try {
-      const lease = sandboxes.requireAccess(req.headers)
+      const lease = access.sandbox(req)
       const contentType = req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase()
       if (contentType !== constants.CONNECT_STREAM) {
         closeUnreadBody(req, reply)
@@ -162,12 +157,12 @@ export function registerProcess(
           .type(constants.CONNECT_STREAM)
           .send(endStream('deadline_exceeded', constants.DEADLINE_MESSAGE))
       }
-      sandboxes.requireAccess(req.headers)
-      if (registry.draining) throw new HttpError('shutting_down', 'server is shutting down')
+      access.sandbox(req)
+      if (access.draining()) throw new HttpError('shutting_down', 'server is shutting down')
       do {
         nextPid = (nextPid % 0xffffffff) + 1
       } while (lease.processes.has(nextPid))
-      return processResponse(lease, command, deadline, nextPid, req.closed, reply, transport)
+      return processResponse(lease, command, deadline, nextPid, req.closed, reply, access.transport)
     } catch (error) {
       closeUnreadBody(req, reply)
       if (uploadDeadline.signal.aborted && error === uploadDeadline.signal.reason) {
@@ -184,6 +179,13 @@ export function registerProcess(
       disarm?.()
     }
   })
+}
+
+/**
+ * List, send input, close stdin and send signal: the commands a sandbox
+ * still runs, which only a host that keeps them past one request can reach.
+ */
+export function registerControl(app: RouteApp, access: DataAccess): void {
   for (const method of constants.CONTROL_METHODS) {
     app.post(constants.PROCESS_PREFIX + method, { rawBody: true }, async (req, reply) => {
       const deadlineSignal = new AbortController()
@@ -192,7 +194,7 @@ export function registerProcess(
       }
       let disarm: (() => void) | undefined
       try {
-        const lease = sandboxes.requireAccess(req.headers)
+        const lease = access.sandbox(req)
         if (unaryContentType(req, constants.CONNECT_STREAM) !== 'application/json') {
           closeUnreadBody(req, reply)
           return failure(reply, 415, 'invalid_argument', 'expected Connect JSON')

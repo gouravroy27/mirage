@@ -1,24 +1,15 @@
 import { ABORT_JOIN_MS, abortable, settledWithin } from '@struktoai/mirage-core/utils/abort'
 import { SYSTEM_IDS } from '@struktoai/mirage-core/utils/ids'
 import { toHex } from '@struktoai/mirage-core/utils/hex'
-import type { BytePipe } from '@struktoai/mirage-core/io/pipe'
-import type { ShellExecution } from '@struktoai/mirage-core/workspace/shell_execution'
-import { HttpError } from '../errors.ts'
+import type { Workspace } from '@struktoai/mirage-core/workspace/workspace/workspace'
 import type { WorkspaceEntry, WorkspaceRegistry } from '../registry.ts'
-import type { StartCommand } from './connect.ts'
-import { ENVD_PORT } from './constants.ts'
+import { type AccessHeaders, sandboxIdOf, verifyAccess } from './access.ts'
 import { SandboxNotRunning } from './errors.ts'
+import type { ActiveSandbox, Lease, LeaseRequest, LeaseStore, LiveProcess } from './types.ts'
 
 const MAX_TIMER_DELAY_MS = 2 ** 31 - 1
 
-export interface LiveProcess {
-  readonly command: StartCommand
-  readonly execution: ShellExecution
-  stdin: BytePipe | undefined
-  killed: boolean
-}
-
-export class SandboxLease {
+export class SandboxLease implements Lease, ActiveSandbox {
   timer?: ReturnType<typeof setTimeout>
   readonly processes = new Map<number, LiveProcess>()
   private readonly revocation = new AbortController()
@@ -31,14 +22,40 @@ export class SandboxLease {
     public expiresAt: number,
   ) {}
 
+  get id(): string {
+    return this.entry.id
+  }
+
+  get sandboxId(): string {
+    return this.entry.id
+  }
+
+  get workspace(): string {
+    return this.entry.id
+  }
+
+  get owner(): string | null {
+    return this.entry.owner
+  }
+
+  get ws(): Workspace {
+    return this.entry.runner.ws
+  }
+
   get revoked(): AbortSignal {
     return this.revocation.signal
   }
 
+  accepting(): boolean {
+    return this.entry.acceptingJobs
+  }
+
+  live(): boolean {
+    return this.entry.acceptingJobs && this.expiresAt > performance.now()
+  }
+
   checkFiles(): void {
-    if (this.revoked.aborted || !this.entry.acceptingJobs || this.expiresAt <= performance.now()) {
-      throw new SandboxNotRunning()
-    }
+    if (this.revoked.aborted || !this.live()) throw new SandboxNotRunning()
   }
 
   async runFile<T>(closed: AbortSignal, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -75,25 +92,27 @@ export class SandboxLease {
   }
 }
 
-export class Sandboxes {
+/**
+ * The daemon's lease store: leases in memory, each expired by a timer, over
+ * workspaces in the daemon's registry. `open` builds a new sandbox's
+ * workspace.
+ */
+export class Sandboxes implements LeaseStore {
   private readonly leases = new Map<string, SandboxLease>()
   private readonly removing = new Set<Promise<WorkspaceEntry>>()
 
   constructor(
     private readonly registry: WorkspaceRegistry,
-    private readonly matchesAccessToken: (expected: string, presented: string) => boolean,
+    private readonly open: (request: LeaseRequest) => Promise<WorkspaceEntry>,
   ) {}
 
-  add(
-    entry: WorkspaceEntry,
-    envVars: Readonly<Record<string, string>>,
-    timeout: number,
-  ): SandboxLease {
+  async create(request: LeaseRequest): Promise<SandboxLease> {
+    const entry = await this.open(request)
     const lease = new SandboxLease(
       entry,
       toHex(SYSTEM_IDS.secureBytes(32)),
-      envVars,
-      performance.now() + timeout * 1000,
+      request.envVars,
+      performance.now() + request.timeout * 1000,
     )
     this.leases.set(entry.id, lease)
     this.schedule(lease)
@@ -104,53 +123,38 @@ export class Sandboxes {
     return lease
   }
 
-  reconnect(id: string, account: string | null, timeout: number): SandboxLease | null {
-    const lease = this.owned(id, account)
-    if (lease === null) return null
-    lease.expiresAt = Math.max(lease.expiresAt, performance.now() + timeout * 1000)
-    this.schedule(lease)
+  get(id: string): Promise<SandboxLease | null> {
+    return Promise.resolve(this.active(id))
+  }
+
+  extend(id: string, owner: string | null, timeout: number): Promise<SandboxLease | null> {
+    const lease = this.owned(id, owner)
+    if (lease !== null) {
+      lease.expiresAt = Math.max(lease.expiresAt, performance.now() + timeout * 1000)
+      this.schedule(lease)
+    }
+    return Promise.resolve(lease)
+  }
+
+  setTimeout(id: string, owner: string | null, timeout: number): Promise<SandboxLease | null> {
+    const lease = this.owned(id, owner)
+    if (lease !== null) {
+      lease.expiresAt = performance.now() + timeout * 1000
+      this.schedule(lease)
+    }
+    return Promise.resolve(lease)
+  }
+
+  async revoke(id: string, owner: string | null): Promise<SandboxLease | null> {
+    const lease = this.owned(id, owner)
+    if (lease !== null) await this.remove(lease)
     return lease
   }
 
-  setTimeout(id: string, account: string | null, timeout: number): boolean {
-    const lease = this.owned(id, account)
-    if (lease === null) return false
-    lease.expiresAt = performance.now() + timeout * 1000
-    this.schedule(lease)
-    return true
-  }
-
-  async kill(id: string, account: string | null): Promise<boolean> {
-    const lease = this.owned(id, account)
-    if (lease === null) return false
-    await this.revoke(lease)
-    return true
-  }
-
-  requireAccess(
-    headers: Readonly<Record<string, string | readonly string[] | undefined>>,
-  ): SandboxLease {
-    const id = headers['e2b-sandbox-id']
-    if (typeof id !== 'string' || id === '' || headers['e2b-sandbox-port'] !== ENVD_PORT) {
-      throw new HttpError('invalid_request', 'invalid sandbox routing headers')
-    }
-    const token = headers['x-access-token']
-    if (typeof token !== 'string' || token === '') {
-      throw new HttpError('unauthorized', 'invalid sandbox access token')
-    }
-    const lease = this.active(id)
-    if (lease === null) throw new SandboxNotRunning()
-    if (!this.matchesAccessToken(lease.accessToken, token)) {
-      throw new HttpError('unauthorized', 'invalid sandbox access token')
-    }
-    const authorization = headers.authorization
-    if (
-      typeof authorization === 'string' &&
-      /^basic /i.test(authorization) &&
-      authorization.slice(6) !== 'dXNlcjo='
-    ) {
-      throw new HttpError('invalid_request', 'only the default sandbox user is supported')
-    }
+  requireAccess(headers: AccessHeaders): SandboxLease {
+    const id = sandboxIdOf(headers)
+    const lease = id === null ? null : this.active(id)
+    verifyAccess(headers, lease)
     return lease
   }
 
@@ -188,7 +192,7 @@ export class Sandboxes {
     if (this.leases.get(lease.entry.id) === lease) this.leases.delete(lease.entry.id)
   }
 
-  private async revoke(lease: SandboxLease): Promise<void> {
+  private async remove(lease: SandboxLease): Promise<void> {
     this.forget(lease)
     if (!this.isRegistered(lease)) return
     const removal = this.registry.remove(lease.entry.id)
@@ -201,7 +205,7 @@ export class Sandboxes {
   }
 
   private expire(lease: SandboxLease): void {
-    void this.revoke(lease).catch((error: unknown) => {
+    void this.remove(lease).catch((error: unknown) => {
       console.error(`removing sandbox ${lease.entry.id}:`, error)
     })
   }
@@ -218,4 +222,12 @@ export class Sandboxes {
       Math.min(MAX_TIMER_DELAY_MS, Math.ceil(lease.expiresAt - performance.now())),
     )
   }
+}
+
+/** The in-memory lease store over `registry`, building each workspace with `open`. */
+export function memoryLeases(
+  registry: WorkspaceRegistry,
+  open: (request: LeaseRequest) => Promise<WorkspaceEntry>,
+): Sandboxes {
+  return new Sandboxes(registry, open)
 }

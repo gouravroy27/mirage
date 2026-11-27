@@ -12,8 +12,6 @@
 // limitations under the License.
 // ========= Copyright 2026 @ Strukto.AI All Rights Reserved. =========
 
-import { Buffer } from 'node:buffer'
-import { timingSafeEqual } from 'node:crypto'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import Fastify, {
@@ -90,15 +88,13 @@ import { traceContextMiddleware } from './trace.ts'
 import { isStopped } from './routers/workspaces.ts'
 import { ENV_E2B_PORT } from './env.ts'
 import { CONNECT_STREAM } from './e2b/constants.ts'
-import { connectCode } from './e2b/errors.ts'
-import { Sandboxes } from './e2b/sandbox.ts'
+import { acceptsRawBody, errorBody, isLifecycleRequest } from './e2b/access.ts'
+import { memoryLeases } from './e2b/sandbox.ts'
 import {
-  acceptsRawBody,
-  isDataRequest,
-  isLifecycleRequest,
   router as registerE2BRoutes,
   sandboxAccount,
   sandboxWorkspace,
+  sandboxWorkspaces,
 } from './routers/e2b.ts'
 
 export interface BuildAppOptions {
@@ -261,14 +257,6 @@ function noop(): void {
   /* intentional no-op for onIdleExit default */
 }
 
-function matchesAccessToken(expected: string, presented: string): boolean {
-  const expectedBytes = Buffer.from(expected)
-  const presentedBytes = Buffer.from(presented)
-  return (
-    expectedBytes.length === presentedBytes.length && timingSafeEqual(expectedBytes, presentedBytes)
-  )
-}
-
 export function resolveE2bPort(
   port?: number,
   env: Record<string, string | undefined> = process.env,
@@ -368,11 +356,10 @@ function requestGuards(
 
 function e2bError(reply: FastifyReply, error: HttpError): FastifyReply {
   const request = reply.request
-  const data = isDataRequest(request.method, request.routeOptions.url ?? '')
   for (const [name, value] of Object.entries(error.headers)) reply.header(name, value)
   return reply
     .code(error.status)
-    .send({ code: data ? connectCode(error.status) : error.status, message: error.message })
+    .send(errorBody(request.method, request.routeOptions.url ?? '', error))
 }
 
 export function buildApp(options: BuildAppOptions = {}) {
@@ -458,7 +445,15 @@ export function buildApp(options: BuildAppOptions = {}) {
       ? null
       : {
           app: server(e2bError),
-          sandboxes: new Sandboxes(registry, matchesAccessToken),
+          sandboxes: memoryLeases(
+            registry,
+            sandboxWorkspaces({
+              registry,
+              host,
+              resources,
+              snapshotStore: options.snapshotStore,
+            }),
+          ),
           port: e2bPort,
         }
   if (companion !== null) {
@@ -498,13 +493,7 @@ export function buildApp(options: BuildAppOptions = {}) {
         }
       })
     }
-    registerE2BRoutes(fastifyRoutes(e2b), {
-      registry,
-      host,
-      resources,
-      snapshotStore: options.snapshotStore,
-      sandboxes,
-    })
+    registerE2BRoutes(fastifyRoutes(e2b), { registry, sandboxes })
     listenTogether(app, e2b, port)
   }
   const ssh: SSHEndpoint = {
