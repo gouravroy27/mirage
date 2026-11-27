@@ -19,14 +19,6 @@ import { PolicyDenied } from '@struktoai/mirage-core/policy/errors'
 import type { JsonValue } from '@struktoai/mirage-core/types'
 import { z } from '@struktoai/mirage-core/vfs/secrets'
 import type { FastifyError, FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
-import { stderr } from 'node:process'
-import { format } from 'node:util'
-
-const logger = {
-  error: (...args: unknown[]): void => {
-    stderr.write(`${format(...args)}\n`)
-  },
-}
 
 /** What went wrong, for a client to branch on. Each answers one status (`STATUS`). Mirrors Python's `ErrorCode`. */
 export const ErrorCode = {
@@ -369,7 +361,7 @@ export function errorOf(err: unknown): HttpError {
   if (framework?.validation !== undefined) return schemaError(err as FastifyError)
   const known = framework?.code === undefined ? undefined : FRAMEWORK[framework.code]
   if (known !== undefined) return new HttpError(known[0], known[1])
-  logger.error('mirage: unhandled error', err)
+  console.error('mirage: unhandled error', err)
   return new HttpError('internal', INTERNAL_MESSAGE)
 }
 
