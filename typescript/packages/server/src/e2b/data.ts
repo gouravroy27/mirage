@@ -1,18 +1,21 @@
 import { DEFAULT_MAX_REQUEST_BODY_SIZE } from '@modelcontextprotocol/server'
 import { closeQuietly } from '@struktoai/mirage-core/io/stream'
+import { abortable } from '@struktoai/mirage-core/utils/abort'
 import { concat } from '@struktoai/mirage-core/utils/bytes'
 import { withCaller } from '@struktoai/mirage-core/workspace/files'
-import { Session } from '@struktoai/mirage-core/workspace/workspace/workspace'
+import { Session, type Workspace } from '@struktoai/mirage-core/workspace/workspace/workspace'
 import { z } from '@struktoai/mirage-core/vfs/secrets'
 import { HttpError } from '../errors.ts'
 import { partEvents } from '../multipart.ts'
 import type { RouteApp, RouteReply, RouteRequest } from '../routes.ts'
+import { sandboxIdOf } from './access.ts'
 import { bodyChunks, closeUnreadBody, readJsonBody, unaryContentType } from './body.ts'
 import * as constants from './constants.ts'
 import { CONNECT_STATUS, FileError, connectCode, fileError } from './errors.ts'
 import { SandboxFiles } from './files.ts'
 import { registerStart } from './process.ts'
-import type { ActiveSandbox, DataAccess } from './types.ts'
+import type { ActiveSandbox, DataAccess, DataHandler, DataSandbox, LiveProcess } from './types.ts'
+import { E2BRoutes } from './web.ts'
 
 const Path = z.object({ path: z.string() })
 const FileQuery = Path.extend({ username: z.string().optional() })
@@ -261,3 +264,59 @@ export function registerData(app: RouteApp, access: DataAccess): void {
   }
 }
 
+/**
+ * One sandbox for one web request, once the host has checked its access. Its
+ * workspace outlives the request, so nothing here revokes it; a command it
+ * starts is not kept for the process control routes.
+ */
+class RequestSandbox implements ActiveSandbox {
+  readonly processes = new Map<number, LiveProcess>()
+  readonly revoked = new AbortController().signal
+
+  constructor(
+    readonly id: string,
+    readonly ws: Workspace,
+    readonly envVars: Readonly<Record<string, string>>,
+  ) {}
+
+  accepting(): boolean {
+    return true
+  }
+
+  live(): boolean {
+    return true
+  }
+
+  checkFiles(): void {
+    this.revoked.throwIfAborted()
+  }
+
+  async runFile<T>(closed: AbortSignal, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    closed.throwIfAborted()
+    const result = await abortable(run(closed), closed)
+    closed.throwIfAborted()
+    return result
+  }
+}
+
+const WEB = new E2BRoutes<ActiveSandbox>()
+registerData(WEB, {
+  sandbox: (request) => WEB.contextOf(request),
+  draining: () => false,
+  transport: (body) => body,
+})
+
+/**
+ * Answer one data request against `sandbox`, after `checkSandboxAccess` let
+ * it through. Process control is not served: its routes answer 404.
+ */
+export const dataRoutes: DataHandler = (request: Request, sandbox: DataSandbox) =>
+  WEB.fetch(
+    request,
+    null,
+    new RequestSandbox(
+      sandboxIdOf(Object.fromEntries(request.headers)) ?? '',
+      sandbox.workspace,
+      sandbox.envVars,
+    ),
+  )

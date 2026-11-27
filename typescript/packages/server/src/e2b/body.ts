@@ -78,7 +78,11 @@ export async function readJsonBody(
   signal: AbortSignal,
   limit: number,
 ): Promise<unknown> {
-  const bytes = await readBody(request, signal, limit)
+  return parseJson(await readBody(request, signal, limit))
+}
+
+/** A JSON body, refusing a key that would reach an object's prototype; none when empty. */
+export function parseJson(bytes: Uint8Array): unknown {
   if (bytes.byteLength === 0) return undefined
   try {
     const value: unknown = JSON.parse(new TextDecoder().decode(bytes))

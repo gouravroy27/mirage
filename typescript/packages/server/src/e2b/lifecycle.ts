@@ -3,7 +3,8 @@ import { HttpError } from '../errors.ts'
 import { MAX_REQUEST_PART } from '../multipart.ts'
 import type { RouteApp, RouteReply } from '../routes.ts'
 import * as constants from './constants.ts'
-import type { Lease, LeaseStore } from './types.ts'
+import type { Lease, LeaseStore, LifecycleHandler } from './types.ts'
+import { E2BRoutes } from './web.ts'
 
 const Timeout = z.number().int().positive().default(constants.DEFAULT_TIMEOUT)
 const CreateSandboxRequest = z.looseObject({
@@ -125,3 +126,9 @@ export function registerLifecycle(app: RouteApp, leases: LeaseStore): void {
   }
 }
 
+/** The lifecycle routes over `leases`, as one web handler. */
+export function lifecycleRoutes(options: { leases: LeaseStore }): LifecycleHandler {
+  const routes = new E2BRoutes<null>()
+  registerLifecycle(routes, options.leases)
+  return (request, caller) => routes.fetch(request, caller.owner, null)
+}
